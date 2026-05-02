@@ -83,6 +83,21 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 rewardPerTokenStored;
         uint256 queuedPenalty;
     }
+	
+		struct PendingUnstake {
+    address user;
+    uint256 stakeId;
+    uint128 amount;
+    uint128 boostedAmount;
+    uint64 unlockTime;
+    uint64 requestTime;
+    bool processed;
+}
+
+PendingUnstake[] public pendingUnstakes;
+
+uint256 public nextPendingIndex;
+uint256 public lastProcessedPendingIndex;
 
     mapping(address => RewardData) public rewardData;
     address[] public rewardTokensList;
@@ -146,26 +161,66 @@ contract Staking is IStaking, Ownable2Step, ReentrancyGuard, Pausable {
 
     /// @notice Withdraws a fully unlocked stake position.
     /// @param stakeId The caller's stake index to close.
-    function unstake(uint256 stakeId) external nonReentrant {
-        Stake storage userStake = _getUserStakeStorage(msg.sender, stakeId);
-        if (userStake.withdrawn) revert StakeAlreadyWithdrawn(stakeId);
-        if (block.timestamp < userStake.unlockTime) revert StakeLocked(stakeId, userStake.unlockTime);
+ function unstake(uint256 stakeId) external nonReentrant {
+    Stake storage userStake = _getUserStakeStorage(msg.sender, stakeId);
+    if (userStake.withdrawn) revert StakeAlreadyWithdrawn(stakeId);
 
-        _updateRewardAll(msg.sender);
+    _updateRewardAll(msg.sender);
 
-        uint128 amount = userStake.amount;
-        uint128 boostedAmount = userStake.boostedAmount;
+    uint128 amount = userStake.amount;
+    uint128 boostedAmount = userStake.boostedAmount;
 
-        userStake.withdrawn = true;
-        totalRawSupply -= amount;
-        totalBoostedSupply -= boostedAmount;
-        _userActiveStakeCount[msg.sender] -= 1;
-        _userBoostedAmount[msg.sender] -= boostedAmount;
+    // mark stake as logically withdrawn (but NOT actually released yet)
+    userStake.withdrawn = true;
 
-        stakingToken.safeTransfer(msg.sender, amount);
+    pendingUnstakes.push(
+        PendingUnstake({
+            user: msg.sender,
+            stakeId: stakeId,
+            amount: amount,
+            boostedAmount: boostedAmount,
+            unlockTime: userStake.unlockTime,
+            requestTime: uint64(block.timestamp),
+            processed: false
+        })
+    );
 
-        emit Unstaked(msg.sender, stakeId, amount);
+    emit Unstaked(msg.sender, stakeId, amount);
+}
+
+function processPendingUnstakes(uint256 maxIterations) external onlyOwner nonReentrant {
+    uint256 length = pendingUnstakes.length;
+    uint256 index = lastProcessedPendingIndex;
+
+    uint256 processed;
+
+    while (index < length && processed < maxIterations) {
+        PendingUnstake storage p = pendingUnstakes[index];
+
+        if (!p.processed && block.timestamp >= p.unlockTime) {
+            _finalizeUnstake(p);
+            p.processed = true;
+            processed++;
+        }
+
+        index++;
     }
+
+    lastProcessedPendingIndex = index;
+}
+
+
+function _finalizeUnstake(PendingUnstake storage p) internal {
+    address user = p.user;
+
+    totalRawSupply -= p.amount;
+    totalBoostedSupply -= p.boostedAmount;
+    _userActiveStakeCount[msg.sender] -= 1;
+    _userBoostedAmount[msg.sender] -= p.boostedAmount;
+    stakingToken.safeTransfer(user, p.amount);
+
+    emit Unstaked(user, p.stakeId, p.amount);
+}
 
     /// @notice Exits a still-locked stake early and routes the penalty to eligible existing stakers.
     /// @param stakeId The caller's stake index to close early.
